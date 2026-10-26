@@ -13,10 +13,10 @@ if (!Number.isSafeInteger(OWNER_ID) || OWNER_ID <= 0) {
   throw new Error("OWNER_TELEGRAM_ID is missing or invalid");
 }
 
-const bot = new Telegraf(BOT_TOKEN);
+const bot = new Telegraf(BOT_TOKEN, { handlerTimeout: 9_000_000 }); // 2.5 ساعة بدل 90 ثانية
 
 const CONFIG = {
-  maxPagesPerPdf: 12,
+  maxPagesPerPdf: 1,
   maxPagesPerJob: 400,
   maxImageBytes: 25 * 1024 * 1024,
   targetMin: 70 * 1024,
@@ -103,6 +103,7 @@ async function searchGalleries(query, mode) {
   const results = await hitomi.galleries.list(options);
   return Array.isArray(results) ? results : [];
 }
+
 
 function getGalleryIdFromResult(item) {
   const raw = item && (item.id || item.galleryid || item.galleryId);
@@ -269,6 +270,17 @@ async function createPdf(buffers) {
   return Buffer.from(await pdf.save({ useObjectStreams: true }));
 }
 
+async function withRetry(fn, retries = 3) {
+  for (let i = 0; i < retries; i++) {
+    try { return await fn(); }
+    catch (err) {
+      if (i === retries - 1) throw err;
+      console.log(`Retry ${i + 1} after error: ${err.message}`);
+      await sleep(3000); // انتظر 3 ثواني قبل المحاولة
+    }
+  }
+}
+
 async function processGallery(ctx, galleryId, mode) {
   if (activeJobs >= CONFIG.maxConcurrentJobs) {
     return ctx.reply("هناك عملية أخرى قيد التنفيذ. حاول بعد انتهائها.");
@@ -349,10 +361,7 @@ async function processGallery(ctx, galleryId, mode) {
         }
 
         try {
-          await ctx.replyWithDocument(
-            { source: pdfBuffer, filename: `Hitomi_${galleryId}_Part_${String(part + 1).padStart(2, "0")}.pdf` },
-            { caption: `📕 المعرض ${galleryId}\nالصفحات: ${start + 1}-${end}\nالصور الناجحة: ${buffers.length}` }
-          );
+          await withRetry(() => ctx.replyWithDocument(...));
         } catch (err) {
           console.error("PDF upload error:", err.message);
           await ctx.reply("فشل إرسال ملف PDF.");
@@ -391,7 +400,6 @@ bot.action(/^pdf:(\d+)$/, async ctx => {
 });
 
 bot.action(/^photos:(\d+)$/, async ctx => {
-	
   try {
     await ctx.answerCbQuery("بدأت المعالجة");
     return processGallery(ctx, Number(ctx.match[1]), "photos");
