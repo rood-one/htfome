@@ -16,7 +16,7 @@ if (!Number.isSafeInteger(OWNER_ID) || OWNER_ID <= 0) {
 const bot = new Telegraf(BOT_TOKEN);
 
 const CONFIG = {
-  maxPagesPerPdf: 40,
+  maxPagesPerPdf: 12,
   maxPagesPerJob: 400,
   maxImageBytes: 25 * 1024 * 1024,
   targetMin: 70 * 1024,
@@ -85,9 +85,14 @@ function getSearchQuery(ctx) {
 }
 
 function normalizeTitle(gallery) {
-  const title = gallery && gallery.title;
-  if (typeof title === "string") return title;
-  if (title && typeof title.display === "string") return title.display;
+  // الطريقة الصحيحة حسب توثيق node-hitomi 9.x
+  if (gallery && gallery.title && typeof gallery.title.display === "string") {
+    return gallery.title.display;
+  }
+  // احتياطي في حال تغير الهيكل
+  if (gallery && typeof gallery.title === "string") {
+    return gallery.title;
+  }
   return "Untitled gallery";
 }
 
@@ -370,16 +375,23 @@ async function processGallery(ctx, galleryId, mode) {
 
 // ✅ إضافة try/catch لطباعة الأخطاء الحقيقية
 bot.action(/^pdf:(\d+)$/, async ctx => {
+  await ctx.answerCbQuery("بدأت المعالجة");
   try {
-    await ctx.answerCbQuery("بدأت المعالجة");
-    return processGallery(ctx, Number(ctx.match[1]), "pdf");
+    return await processGallery(ctx, Number(ctx.match[1]), "pdf");
   } catch (err) {
-    console.error("PDF action error:", err);
-    await ctx.reply("حدث خطأ: " + err.message);
+    console.error("PDF error:", err.message);
+    await ctx.reply("فشل الإرسال. جاري إعادة المحاولة...").catch(() => {});
+    // إعادة محاولة واحدة
+    try {
+      return await processGallery(ctx, Number(ctx.match[1]), "pdf");
+    } catch (err2) {
+      await ctx.reply("فشل الإرسال بعد إعادة المحاولة: " + err2.message).catch(() => {});
+    }
   }
 });
 
 bot.action(/^photos:(\d+)$/, async ctx => {
+	
   try {
     await ctx.answerCbQuery("بدأت المعالجة");
     return processGallery(ctx, Number(ctx.match[1]), "photos");
