@@ -123,7 +123,9 @@ try {
 }
 
 function getSearchQuery(ctx) {
-return ctx.message.text.replace(/^/search(?:@\w+)?\s*/i, "").trim();
+  return ctx.message.text
+    .replace(/^\/search(?:@\w+)?\s*/i, "")
+    .trim();
 }
 
 function normalizeTitle(gallery) {
@@ -266,8 +268,8 @@ try {
 
 bot.command("title", async ctx => {
 const query = ctx.message.text
-.replace(/^/title(?:@\w+)?\s*/i, "")
-.trim();
+  .replace(/^\/title(?:@\w+)?\s*/i, "")
+  .trim();
 
 if (!query) {
     return ctx.reply("مثال:\n/title blue archive");
@@ -327,8 +329,8 @@ Markup.button.callback("🖼️ إرسال الصور", "photos:${galleryId}")
 
 bot.command("view", async ctx => {
 const raw = ctx.message.text
-.replace(/^/view(?:@\w+)?\s*/i, "")
-.trim();
+  .replace(/^\/view(?:@\w+)?\s*/i, "")
+  .trim();
 
 const id = extractGalleryId(raw);
 
