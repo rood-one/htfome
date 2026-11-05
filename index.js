@@ -1,4 +1,4 @@
-const { Telegraf, Markup, Input } = require("telegraf");
+code = r'''const { Telegraf, Markup, Input } = require("telegraf");
 const { hitomi, Extension } = require("node-hitomi");
 const sharp = require("sharp");
 const { PDFDocument } = require("pdf-lib");
@@ -6,436 +6,758 @@ const http = require("http");
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const OWNER_ID = Number(process.env.OWNER_TELEGRAM_ID);
-const PORT = Number(process.env.PORT) || 3000;
+const PORT = Number(process.env.PORT) || 10000;
 
 if (!BOT_TOKEN) throw new Error("BOT_TOKEN is missing");
 if (!Number.isSafeInteger(OWNER_ID) || OWNER_ID <= 0) {
-  throw new Error("OWNER_TELEGRAM_ID is missing or invalid");
+    throw new Error("OWNER_TELEGRAM_ID is missing or invalid");
 }
 
-const bot = new Telegraf(BOT_TOKEN, { handlerTimeout: 9_000_000 }); // 2.5 ساعة بدل 90 ثانية
-
 const CONFIG = {
-  maxPagesPerPdf: 1,
-  maxPagesPerJob: 400,
-  maxImageBytes: 25 * 1024 * 1024,
-  targetMin: 70 * 1024,
-  targetMax: 120 * 1024,
-  maxWidth: 1400,
-  downloadRetries: 3,
-  requestTimeout: 30000,
-  maxConcurrentJobs: 1,
-  maxPdfBytes: 45 * 1024 * 1024
+    maxPagesPerJob: 400,
+    maxImageBytes: 25 * 1024 * 1024,
+    targetImageBytes: 120 * 1024,
+    maxWidth: 1400,
+    downloadRetries: 3,
+    uploadRetries: 3,
+    maxPdfBytes: 45 * 1024 * 1024,
+    pdfPagesPerPart: 25,
+    photoGroupSize: 10,
+    maxSearchResults: 50,
+    searchPageSize: 5,
+    requestDelayMs: 150
 };
+
+const bot = new Telegraf(BOT_TOKEN, { handlerTimeout: 120_000 });
 
 let activeJobs = 0;
 let shuttingDown = false;
-const sessions = new Map();
 
-// Health check server
+const sessions = new Map();
+const runningJobs = new Set();
+
+// Render health-check server
 const server = http.createServer((req, res) => {
-  res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
-  res.end("Bot is alive\n");
+    res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+    res.end("Bot is alive\n");
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Health server listening on ${PORT}`); // تم إصلاح backticks
+    console.log(`Health server listening on ${PORT}`);
 });
 
 function isOwner(ctx) {
-  return ctx.from && ctx.from.id === OWNER_ID;
+    return Boolean(ctx.from && ctx.from.id === OWNER_ID);
 }
 
 bot.use(async (ctx, next) => {
-  if (ctx.from && !isOwner(ctx)) {
-    if (ctx.callbackQuery) return ctx.answerCbQuery("هذا البوت خاص.").catch(() => {});
-    if (ctx.message) return ctx.reply("هذا البوت مخصص لصاحبه فقط.");
-    return;
-  }
-  if (shuttingDown) return;
-  try {
-    await next();
-  } catch (err) {
-    console.error("Update error:", err.message);
-  }
+    if (ctx.from && !isOwner(ctx)) {
+        if (ctx.callbackQuery) {
+            return ctx.answerCbQuery("هذا البوت خاص.").catch(() => {});
+        }
+        if (ctx.message) {
+            return ctx.reply("هذا البوت مخصص لصاحبه فقط.").catch(() => {});
+        }
+        return;
+    }
+
+    if (shuttingDown) return;
+
+    try {
+        await next();
+    } catch (err) {
+        console.error("Middleware error:", safeError(err));
+    }
 });
 
-function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
-function safeError(err) { return String(err && err.message || "Unknown error").slice(0, 350); }
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function safeError(err) {
+    return String(err && (err.message || err) || "Unknown error").slice(0, 500);
+}
 
 function extractGalleryId(text) {
-  const input = String(text || "").trim();
-  if (/^\d+$/.test(input)) {
-    const id = Number(input);
-    return Number.isSafeInteger(id) && id > 0 ? id : null;
-  }
-  try {
-    const url = new URL(input);
-    if (!["hitomi.la", "www.hitomi.la"].includes(url.hostname.toLowerCase())) return null;
-    const match = url.pathname.match(/^\/reader\/(\d+)\.html$/);
-    if (!match) return null;
-    const id = Number(match[1]);
-    return Number.isSafeInteger(id) && id > 0 ? id : null;
-  } catch (_) { return null; }
+    const input = String(text || "").trim();
+
+    if (/^\d+$/.test(input)) {
+        const id = Number(input);
+        return Number.isSafeInteger(id) && id > 0 ? id : null;
+    }
+
+    try {
+        const url = new URL(input);
+        const host = url.hostname.toLowerCase();
+
+        if (host !== "hitomi.la" && host !== "www.hitomi.la") {
+            return null;
+        }
+
+        const match = url.pathname.match(/^\/reader\/(\d+)\.html$/);
+        if (!match) return null;
+
+        const id = Number(match[1]);
+        return Number.isSafeInteger(id) && id > 0 ? id : null;
+    } catch (_) {
+        return null;
+    }
 }
 
-// ✅ إصلاح: استخدام Backticks مع الهروب الصحيح
-function getSearchQuery(ctx) {
-  return ctx.message.text.replace(/^\/search(?:@\w+)?\s*/i, "").trim();
+function getCommandQuery(ctx, command) {
+    const text = String(ctx.message && ctx.message.text || "");
+    return text.replace(new RegExp("^\\/" + command + "(?:@\\w+)?\\s*", "i"), "").trim();
 }
 
-function normalizeTitle(gallery) {
-  // الطريقة الصحيحة حسب توثيق node-hitomi 9.x
-  if (gallery && gallery.title && typeof gallery.title.display === "string") {
-    return gallery.title.display;
-  }
-  // احتياطي في حال تغير الهيكل
-  if (gallery && typeof gallery.title === "string") {
-    return gallery.title;
-  }
-  return "Untitled gallery";
+function normalizeTitle(item) {
+    if (item && item.title && typeof item.title.display === "string") {
+        return item.title.display;
+    }
+    if (item && typeof item.title === "string") {
+        return item.title;
+    }
+    return "Untitled gallery";
 }
-
-async function searchGalleries(query, mode) {
-  const tags = hitomi.tags.parse(`language:english ${query}`);
-  const options = { tags };
-  if (mode === "title") options.title = query;
-  const results = await hitomi.galleries.list(options);
-  return Array.isArray(results) ? results : [];
-}
-
 
 function getGalleryIdFromResult(item) {
-  const raw = item && (item.id || item.galleryid || item.galleryId);
-  const id = Number(raw);
-  return Number.isSafeInteger(id) && id > 0 ? id : null;
+    const raw = item && (item.id || item.galleryid || item.galleryId);
+    const id = Number(raw);
+    return Number.isSafeInteger(id) && id > 0 ? id : null;
 }
 
-function makeResultKeyboard(results, page) {
-  const start = page * 5;
-  const current = results.slice(start, start + 5);
-  const rows = current.map((item, index) => {
-    const id = getGalleryIdFromResult(item);
-    const title = normalizeTitle(item);
-    const label = `${start + index + 1}. ${title}`.slice(0, 55);
-    if (!id) return null;
-    return [Markup.button.callback(label, `gallery:${id}`)];
-  }).filter(Boolean);
-
-  const navigation = [];
-  if (page > 0) navigation.push(Markup.button.callback("⬅️ السابق", `results:${page - 1}`));
-  if (start + 5 < results.length) navigation.push(Markup.button.callback("التالي ➡️", `results:${page + 1}`));
-  if (navigation.length) rows.push(navigation);
-  return Markup.inlineKeyboard(rows);
+function normalizeTagSearchTerm(query) {
+    return String(query || "")
+        .trim()
+        .replace(/\s+/g, "_")
+        .replace(/:/g, ":");
 }
 
-async function sendSearchResults(ctx, query, mode, page = 0) {
-  const results = await searchGalleries(query, mode);
-  if (!results.length) return ctx.reply("لم أجد نتائج. جرّب عبارة أخرى.");
-  const valid = results.filter(item => getGalleryIdFromResult(item)).slice(0, 50);
-  if (!valid.length) return ctx.reply("لم أستطع قراءة معرفات النتائج.");
-  sessions.set(ctx.from.id, { query, mode, results: valid });
-  return ctx.reply(`نتائج البحث: ${query}\nعدد النتائج المعروضة: ${valid.length}`, makeResultKeyboard(valid, page));
+function getTagString(tag) {
+    return String(tag || "").trim();
+}
+
+async function searchTagCandidates(query) {
+    const term = normalizeTagSearchTerm(query);
+    if (!term) return [];
+
+    // node-hitomi 9.2.0 returns [Tag, galleryCount] tuples.
+    const raw = await hitomi.tags.search(term);
+
+    if (!Array.isArray(raw)) return [];
+
+    return raw
+        .map(entry => {
+            if (!Array.isArray(entry) || !entry[0]) return null;
+
+            const tag = entry[0];
+            const count = Number(entry[1]) || 0;
+
+            return {
+                tagText: getTagString(tag),
+                count
+            };
+        })
+        .filter(item => item && item.tagText)
+        .slice(0, CONFIG.maxSearchResults);
+}
+
+async function searchGalleriesByTag(tagText) {
+    const tags = hitomi.tags.parse(tagText);
+    const refs = await hitomi.galleries.list({ tags });
+
+    return Array.isArray(refs) ? refs : [];
+}
+
+async function searchGalleriesByTitle(query) {
+    const refs = await hitomi.galleries.list({ title: query });
+    return Array.isArray(refs) ? refs : [];
+}
+
+function makeTagKeyboard(tags, page = 0) {
+    const start = page * CONFIG.searchPageSize;
+    const current = tags.slice(start, start + CONFIG.searchPageSize);
+
+    const rows = current.map((item, index) => {
+        const label = `${start + index + 1}. ${item.tagText} (${item.count})`;
+        return [
+            Markup.button.callback(
+                label.slice(0, 60),
+                `tagpick:${start + index}`
+            )
+        ];
+    });
+
+    const navigation = [];
+    if (page > 0) {
+        navigation.push(Markup.button.callback("⬅️ السابق", `tagpage:${page - 1}`));
+    }
+    if (start + CONFIG.searchPageSize < tags.length) {
+        navigation.push(Markup.button.callback("التالي ➡️", `tagpage:${page + 1}`));
+    }
+    if (navigation.length) rows.push(navigation);
+
+    return Markup.inlineKeyboard(rows);
+}
+
+function makeGalleryKeyboard(results, page = 0) {
+    const start = page * CONFIG.searchPageSize;
+    const current = results.slice(start, start + CONFIG.searchPageSize);
+
+    const rows = current.map((item, index) => {
+        const id = getGalleryIdFromResult(item);
+        if (!id) return null;
+
+        const label = `${start + index + 1}. ${normalizeTitle(item)}`;
+        return [Markup.button.callback(label.slice(0, 60), `gallery:${id}`)];
+    }).filter(Boolean);
+
+    const navigation = [];
+    if (page > 0) {
+        navigation.push(Markup.button.callback("⬅️ السابق", `gallerypage:${page - 1}`));
+    }
+    if (start + CONFIG.searchPageSize < results.length) {
+        navigation.push(Markup.button.callback("التالي ➡️", `gallerypage:${page + 1}`));
+    }
+    if (navigation.length) rows.push(navigation);
+
+    return Markup.inlineKeyboard(rows);
+}
+
+async function showTagSearchResults(ctx, query) {
+    const tags = await searchTagCandidates(query);
+
+    if (!tags.length) {
+        return ctx.reply("لم أجد تاغات مطابقة. جرّب كلمة أخرى.");
+    }
+
+    sessions.set(ctx.from.id, {
+        type: "tags",
+        query,
+        tags
+    });
+
+    return ctx.reply(
+        `🔎 نتائج التاغات: ${query}\nعدد النتائج: ${tags.length}\nاختر التاغ المطلوب:`,
+        makeTagKeyboard(tags, 0)
+    );
+}
+
+async function showGallerySearchResults(ctx, query, mode, results) {
+    const valid = results
+        .filter(item => getGalleryIdFromResult(item))
+        .slice(0, CONFIG.maxSearchResults);
+
+    if (!valid.length) {
+        return ctx.reply("لم أجد معارض مطابقة.");
+    }
+
+    sessions.set(ctx.from.id, {
+        type: "galleries",
+        query,
+        mode,
+        results: valid
+    });
+
+    return ctx.reply(
+        `نتائج البحث: ${query}\nعدد النتائج المعروضة: ${valid.length}`,
+        makeGalleryKeyboard(valid, 0)
+    );
 }
 
 bot.start(ctx => ctx.reply(
-  "أهلًا بك.\n\n" +
-  "/search blue archive - البحث بالتاغ\n" +
-  "/title blue archive - البحث بالعنوان\n" +
-  "/view 1916532 - فتح معرض بالمعرف\n\n" +
-  "أرسل رابط Hitomi لتحويل المعرض إلى PDF."
+    "أهلًا بك.\n\n" +
+    "/search blue archive - البحث عن التاغات\n" +
+    "/title blue archive - البحث بالعنوان\n" +
+    "/view 1916532 - فتح معرض بالمعرف\n\n" +
+    "أرسل رابط Hitomi لتحويل المعرض إلى PDF أو صور."
 ));
 
 bot.help(ctx => ctx.reply(
-  "/search كلمة البحث\n/title اسم المعرض\n/view معرف المعرض\n\n" +
-  "يمكنك أيضًا إرسال رابط المعرض مباشرة."
+    "/search كلمة البحث\n" +
+    "/title اسم المعرض\n" +
+    "/view معرف المعرض\n\n" +
+    "يمكنك أيضًا إرسال رابط المعرض مباشرة."
 ));
 
 bot.command("search", async ctx => {
-  const query = getSearchQuery(ctx);
-  if (!query) return ctx.reply("مثال:\n/search blue archive");
-  await ctx.reply("🔎 جاري البحث بالتاغ...");
-  try {
-    await sendSearchResults(ctx, query, "tags");
-  } catch (err) {
-    console.error("Tag search error:", err);
-    await ctx.reply("تعذر إكمال البحث.\n" + safeError(err));
-  }
+    const query = getCommandQuery(ctx, "search");
+    if (!query) return ctx.reply("مثال:\n/search blue archive");
+
+    await ctx.reply("🔎 جاري البحث عن التاغات...");
+    try {
+        await showTagSearchResults(ctx, query);
+    } catch (err) {
+        console.error("Tag search error:", safeError(err));
+        await ctx.reply("تعذر إكمال البحث بالتاغ.\n" + safeError(err));
+    }
 });
 
-// ✅ إصلاح: الهروب الصحيح في regex
 bot.command("title", async ctx => {
-  const query = ctx.message.text.replace(/^\/title(?:@\w+)?\s*/i, "").trim();
-  if (!query) return ctx.reply("مثال:\n/title blue archive");
-  await ctx.reply("🔎 جاري البحث بالعنوان...");
-  try {
-    await sendSearchResults(ctx, query, "title");
-  } catch (err) {
-    console.error("Title search error:", err);
-    await ctx.reply("تعذر إكمال البحث بالعنوان.\n" + safeError(err));
-  }
+    const query = getCommandQuery(ctx, "title");
+    if (!query) return ctx.reply("مثال:\n/title blue archive");
+
+    await ctx.reply("🔎 جاري البحث بالعنوان...");
+    try {
+        const results = await searchGalleriesByTitle(query);
+        await showGallerySearchResults(ctx, query, "title", results);
+    } catch (err) {
+        console.error("Title search error:", safeError(err));
+        await ctx.reply("تعذر إكمال البحث بالعنوان.\n" + safeError(err));
+    }
 });
 
-bot.action(/^results:(\d+)$/, async ctx => {
-  const page = Number(ctx.match[1]);
-  const session = sessions.get(ctx.from.id);
-  if (!session) return ctx.answerCbQuery("انتهت جلسة البحث. ابحث مجددًا.");
-  await ctx.answerCbQuery();
-  return ctx.editMessageReplyMarkup(makeResultKeyboard(session.results, page).reply_markup).catch(() => {});
+bot.action(/^tagpage:(\d+)$/, async ctx => {
+    const page = Number(ctx.match[1]);
+    const session = sessions.get(ctx.from.id);
+
+    if (!session || session.type !== "tags") {
+        return ctx.answerCbQuery("انتهت جلسة البحث. ابحث مجددًا.");
+    }
+
+    await ctx.answerCbQuery();
+
+    return ctx.editMessageReplyMarkup(
+        makeTagKeyboard(session.tags, page).reply_markup
+    ).catch(() => {});
+});
+
+bot.action(/^tagpick:(\d+)$/, async ctx => {
+    const index = Number(ctx.match[1]);
+    const session = sessions.get(ctx.from.id);
+
+    if (!session || session.type !== "tags" || !session.tags[index]) {
+        return ctx.answerCbQuery("انتهت جلسة البحث. ابحث مجددًا.");
+    }
+
+    await ctx.answerCbQuery("جاري جلب المعارض...");
+    const selectedTag = session.tags[index].tagText;
+
+    try {
+        const results = await searchGalleriesByTag(selectedTag);
+        await showGallerySearchResults(ctx, selectedTag, "tags", results);
+    } catch (err) {
+        console.error("Gallery tag search error:", safeError(err));
+        await ctx.reply("تعذر جلب المعارض لهذا التاغ.\n" + safeError(err));
+    }
+});
+
+bot.action(/^gallerypage:(\d+)$/, async ctx => {
+    const page = Number(ctx.match[1]);
+    const session = sessions.get(ctx.from.id);
+
+    if (!session || session.type !== "galleries") {
+        return ctx.answerCbQuery("انتهت جلسة البحث. ابحث مجددًا.");
+    }
+
+    await ctx.answerCbQuery();
+
+    return ctx.editMessageReplyMarkup(
+        makeGalleryKeyboard(session.results, page).reply_markup
+    ).catch(() => {});
 });
 
 bot.action(/^gallery:(\d+)$/, async ctx => {
-  await ctx.answerCbQuery();
-  return showOutputOptions(ctx, Number(ctx.match[1]));
+    await ctx.answerCbQuery();
+    return showOutputOptions(ctx, Number(ctx.match[1]));
 });
 
 async function showOutputOptions(ctx, galleryId) {
-  return ctx.reply(
-    `المعرض: ${galleryId}\nاختر طريقة الإخراج:`,
-    Markup.inlineKeyboard([
-      [Markup.button.callback("📕 PDF مضغوط", `pdf:${galleryId}`)],
-      [Markup.button.callback("🖼️ إرسال الصور", `photos:${galleryId}`)]
-    ])
-  );
+    return ctx.reply(
+        `المعرض: ${galleryId}\nاختر طريقة الإخراج:`,
+        Markup.inlineKeyboard([
+            [Markup.button.callback("📕 PDF مضغوط", `pdf:${galleryId}`)],
+            [Markup.button.callback("🖼️ إرسال الصور", `photos:${galleryId}`)]
+        ])
+    );
 }
 
 bot.command("view", async ctx => {
-  const raw = ctx.message.text.replace(/^\/view(?:@\w+)?\s*/i, "").trim();
-  const id = extractGalleryId(raw);
-  if (!id) return ctx.reply("استخدم:\n/view 1916532");
-  return showOutputOptions(ctx, id);
-});
+    const raw = getCommandQuery(ctx, "view");
+    const id = extractGalleryId(raw);
 
-// ✅ ضغط الصور (كما هو، لكنه الآن يستقبل WebP)
-async function compressImage(input) {
-  const metadata = await sharp(input, { limitInputPixels: 40000000 }).metadata();
-  if (!metadata.width || !metadata.height) throw new Error("تعذر قراءة أبعاد الصورة");
-
-  let width = Math.min(metadata.width, CONFIG.maxWidth);
-  let quality = 76;
-  let best = null;
-
-  for (let attempt = 0; attempt < 8; attempt++) {
-    let output = await sharp(input, { limitInputPixels: 40000000 })
-      .rotate()
-      .resize({ width, withoutEnlargement: true })
-      .flatten({ background: "#ffffff" })
-      .jpeg({ quality, mozjpeg: true, progressive: true })
-      .toBuffer();
-
-    if (output.length <= CONFIG.targetMax) {
-      if (output.length >= CONFIG.targetMin || !best || output.length > best.length) best = output;
-      if (output.length >= CONFIG.targetMin) return output;
-    }
-    if (!best || (output.length <= CONFIG.targetMax && output.length > best.length)) best = output;
-
-    if (output.length > CONFIG.targetMax) {
-      if (quality > 40) quality -= 8;
-      else width = Math.max(500, Math.floor(width * 0.85));
-    } else return output;
-  }
-  if (best) return best;
-  throw new Error("تعذر ضغط الصورة");
-}
-
-// ✅ جلب المعرض والصور بالطريقة الجديدة
-async function retrieveGalleryData(galleryId) {
-  const gallery = await hitomi.galleries.retrieve(galleryId);
-  if (!gallery) throw new Error("لم يتم العثور على المعرض");
-
-  // الطريقة الصحيحة للحصول على قائمة الصور
-  const images = gallery.getThumbnails();
-  if (!Array.isArray(images) || images.length === 0) {
-    throw new Error("لم أجد صورًا في هذا المعرض.");
-  }
-  if (images.length > CONFIG.maxPagesPerJob) {
-    throw new Error(`المعرض يحتوي على ${images.length} صفحة. الحد ${CONFIG.maxPagesPerJob}.`);
-  }
-  return { gallery, images };
-}
-
-// ✅ إنشاء PDF: تحويل WebP إلى JPEG أولاً
-async function createPdf(buffers) {
-  const pdf = await PDFDocument.create();
-  for (const webpBuffer of buffers) {
-    // الخطوة الحاسمة: تحويل WebP إلى JPEG ليتوافق مع pdf-lib
-    const jpegBuffer = await sharp(webpBuffer).jpeg({ quality: 85 }).toBuffer();
-    const metadata = await sharp(jpegBuffer).metadata();
-    const width = metadata.width || 800;
-    const height = metadata.height || 1200;
-    const image = await pdf.embedJpg(jpegBuffer);
-    const page = pdf.addPage([width, height]);
-    page.drawImage(image, { x: 0, y: 0, width, height });
-  }
-  return Buffer.from(await pdf.save({ useObjectStreams: true }));
-}
-
-async function withRetry(fn, retries = 3) {
-  for (let i = 0; i < retries; i++) {
-    try { return await fn(); }
-    catch (err) {
-      if (i === retries - 1) throw err;
-      console.log(`Retry ${i + 1} after error: ${err.message}`);
-      await sleep(3000); // انتظر 3 ثواني قبل المحاولة
-    }
-  }
-}
-
-async function processGallery(ctx, galleryId, mode) {
-  if (activeJobs >= CONFIG.maxConcurrentJobs) {
-    return ctx.reply("هناك عملية أخرى قيد التنفيذ. حاول بعد انتهائها.");
-  }
-  activeJobs++;
-
-  try {
-    const status = await ctx.reply(`📥 جاري جلب المعرض ${galleryId}...`);
-    const { images } = await retrieveGalleryData(galleryId);
-    const count = images.length;
-
-    await ctx.telegram.editMessageText(ctx.chat.id, status.message_id, undefined,
-      `🖼️ عدد الصفحات: ${count}\nجاري تجهيز الصور...`).catch(() => {});
-
-    let completed = 0, failed = 0, buffers = [];
-    const totalParts = Math.ceil(count / CONFIG.maxPagesPerPdf);
-
-    for (let part = 0; part < totalParts; part++) {
-      const start = part * CONFIG.maxPagesPerPdf;
-      const end = Math.min(start + CONFIG.maxPagesPerPdf, count);
-      buffers = [];
-
-      for (let i = start; i < end; i++) {
-        try {
-          // ✅ جلب الصورة مباشرة كـ Uint8Array ثم تحويلها إلى Buffer
-          const imageData = await images[i].fetch(Extension.Webp);
-          const rawBuffer = Buffer.from(imageData);
-          if (rawBuffer.length > CONFIG.maxImageBytes) throw new Error("حجم الصورة كبير جدًا");
-          const compressed = await compressImage(rawBuffer);
-          buffers.push(compressed);
-          completed++;
-        } catch (err) {
-          failed++;
-          console.error(`Page ${i + 1} failed:`, err.message);
-        }
-
-        if ((i + 1) % 5 === 0 || i + 1 === count) {
-          await ctx.telegram.editMessageText(ctx.chat.id, status.message_id, undefined,
-            `📥 جاري المعالجة\n` +
-            `الصفحات المفحوصة: ${i + 1}/${count}\n` +
-            `الصفحات الناجحة: ${completed}\n` +
-            `الصفحات الفاشلة: ${failed}\n` +
-            `الجزء: ${part + 1}/${totalParts}`).catch(() => {});
-        }
-        await sleep(100);
-      }
-
-      if (!buffers.length) continue;
-
-      if (mode === "photos") {
-        for (let i = 0; i < buffers.length; i += 10) {
-          const chunk = buffers.slice(i, i + 10);
-          const media = chunk.map((buffer, index) => ({
-            type: "photo",
-            media: Input.fromBuffer(buffer, `page_${start + i + index + 1}.jpg`)
-          }));
-          try {
-            await ctx.replyWithMediaGroup(media);
-          } catch (err) {
-            console.error("Photo group error:", err.message);
-            await ctx.reply("تعذر إرسال مجموعة صور.");
-          }
-          await sleep(500);
-        }
-      } else {
-        let pdfBuffer;
-        try {
-          pdfBuffer = await createPdf(buffers);
-        } catch (err) {
-          console.error("PDF creation error:", err.message);
-          await ctx.reply("فشل إنشاء ملف PDF لهذا الجزء.");
-          continue;
-        }
-
-        if (pdfBuffer.length > CONFIG.maxPdfBytes) {
-          await ctx.reply(`الجزء ${part + 1} أكبر من الحد المسموح. جرّب إرسال الصور.`);
-          continue;
-        }
-
-        try {
-          await withRetry(() => ctx.replyWithDocument(...));
-        } catch (err) {
-          console.error("PDF upload error:", err.message);
-          await ctx.reply("فشل إرسال ملف PDF.");
-        }
-      }
-      buffers = [];
-      await sleep(300);
-    }
-
-    await ctx.telegram.editMessageText(ctx.chat.id, status.message_id, undefined,
-      `✅ انتهت المعالجة\nالمعرض: ${galleryId}\nالصور الناجحة: ${completed}\nالصور الفاشلة: ${failed}`).catch(() => {});
-
-  } catch (err) {
-    console.error("Gallery job error:", err);
-    await ctx.reply("❌ تعذرت معالجة المعرض:\n" + safeError(err));
-  } finally {
-    activeJobs--;
-  }
-}
-
-// ✅ إضافة try/catch لطباعة الأخطاء الحقيقية
-bot.action(/^pdf:(\d+)$/, async ctx => {
-  await ctx.answerCbQuery("بدأت المعالجة");
-  try {
-    return await processGallery(ctx, Number(ctx.match[1]), "pdf");
-  } catch (err) {
-    console.error("PDF error:", err.message);
-    await ctx.reply("فشل الإرسال. جاري إعادة المحاولة...").catch(() => {});
-    // إعادة محاولة واحدة
-    try {
-      return await processGallery(ctx, Number(ctx.match[1]), "pdf");
-    } catch (err2) {
-      await ctx.reply("فشل الإرسال بعد إعادة المحاولة: " + err2.message).catch(() => {});
-    }
-  }
-});
-
-bot.action(/^photos:(\d+)$/, async ctx => {
-  try {
-    await ctx.answerCbQuery("بدأت المعالجة");
-    return processGallery(ctx, Number(ctx.match[1]), "photos");
-  } catch (err) {
-    console.error("Photos action error:", err);
-    await ctx.reply("حدث خطأ: " + err.message);
-  }
+    if (!id) return ctx.reply("استخدم:\n/view 1916532");
+    return showOutputOptions(ctx, id);
 });
 
 bot.on("text", async ctx => {
-  const text = ctx.message.text.trim();
-  if (text.startsWith("/")) return;
-  const id = extractGalleryId(text);
-  if (!id) return;
-  return showOutputOptions(ctx, id);
+    const text = String(ctx.message.text || "").trim();
+    if (text.startsWith("/")) return;
+
+    const id = extractGalleryId(text);
+    if (!id) return;
+
+    return showOutputOptions(ctx, id);
+});
+
+async function withRetry(fn, retries = CONFIG.downloadRetries, label = "operation") {
+    let lastError;
+
+    for (let attempt = 1; attempt <= retries; attempt++) {
+        try {
+            return await fn();
+        } catch (err) {
+            lastError = err;
+            console.error(
+                `${label} failed (${attempt}/${retries}):`,
+                safeError(err)
+            );
+
+            if (attempt < retries) {
+                await sleep(Math.min(2000 * attempt, 8000));
+            }
+        }
+    }
+
+    throw lastError || new Error(`${label} failed`);
+}
+
+async function retrieveGalleryData(galleryId) {
+    const gallery = await withRetry(
+        () => hitomi.galleries.retrieve(galleryId),
+        CONFIG.downloadRetries,
+        "Gallery retrieval"
+    );
+
+    if (!gallery) throw new Error("لم يتم العثور على المعرض");
+
+    // node-hitomi 9.2.0: gallery.files contains the full image list.
+    // getThumbnails() returns representative thumbnails, not all pages.
+    const images = gallery.files;
+
+    if (!Array.isArray(images) || images.length === 0) {
+        throw new Error("لم يتم العثور على صفحات المعرض (gallery.files فارغة).");
+    }
+
+    if (images.length > CONFIG.maxPagesPerJob) {
+        throw new Error(
+            `المعرض يحتوي على ${images.length} صفحة. الحد الحالي ${CONFIG.maxPagesPerJob}.`
+        );
+    }
+
+    return { gallery, images };
+}
+
+async function fetchImageBuffer(image, pageNumber) {
+    const data = await withRetry(
+        () => image.fetch(Extension.Webp),
+        CONFIG.downloadRetries,
+        `Image ${pageNumber} download`
+    );
+
+    const buffer = Buffer.from(data);
+
+    if (!buffer.length) {
+        throw new Error(`الصورة ${pageNumber} فارغة`);
+    }
+
+    if (buffer.length > CONFIG.maxImageBytes) {
+        throw new Error(`حجم الصورة ${pageNumber} كبير جدًا`);
+    }
+
+    return buffer;
+}
+
+async function compressImage(input) {
+    let metadata = await sharp(input, { limitInputPixels: 40_000_000 }).metadata();
+
+    if (!metadata.width || !metadata.height) {
+        throw new Error("تعذر قراءة أبعاد الصورة");
+    }
+
+    let width = Math.min(metadata.width, CONFIG.maxWidth);
+    let quality = 78;
+    let best = null;
+
+    for (let attempt = 0; attempt < 12; attempt++) {
+        const output = await sharp(input, { limitInputPixels: 40_000_000 })
+            .rotate()
+            .resize({ width, withoutEnlargement: true })
+            .flatten({ background: "#ffffff" })
+            .jpeg({
+                quality,
+                mozjpeg: true,
+                progressive: true
+            })
+            .toBuffer();
+
+        if (!best || output.length < best.length) {
+            best = output;
+        }
+
+        if (output.length <= CONFIG.targetImageBytes) {
+            return output;
+        }
+
+        if (quality > 42) {
+            quality -= 7;
+        } else {
+            width = Math.max(450, Math.floor(width * 0.85));
+            quality = 65;
+        }
+    }
+
+    if (best) return best;
+    throw new Error("تعذر ضغط الصورة");
+}
+
+async function createPdf(imageBuffers) {
+    const pdf = await PDFDocument.create();
+
+    for (let index = 0; index < imageBuffers.length; index++) {
+        const jpegBuffer = await sharp(imageBuffers[index])
+            .jpeg({ quality: 82, mozjpeg: true })
+            .toBuffer();
+
+        const metadata = await sharp(jpegBuffer).metadata();
+        const width = metadata.width || 800;
+        const height = metadata.height || 1200;
+
+        const image = await pdf.embedJpg(jpegBuffer);
+        const page = pdf.addPage([width, height]);
+
+        page.drawImage(image, {
+            x: 0,
+            y: 0,
+            width,
+            height
+        });
+    }
+
+    return Buffer.from(await pdf.save({ useObjectStreams: true }));
+}
+
+async function uploadPdf(ctx, pdfBuffer, galleryId, partNumber, totalParts) {
+    if (pdfBuffer.length > CONFIG.maxPdfBytes) {
+        throw new Error(
+            `حجم PDF (${(pdfBuffer.length / 1024 / 1024).toFixed(1)} MB) تجاوز حد البوت الآمن.`
+        );
+    }
+
+    await withRetry(async () => {
+        const file = Input.fromBuffer(
+            pdfBuffer,
+            `hitomi_${galleryId}_part_${partNumber}.pdf`
+        );
+
+        await ctx.replyWithDocument(file, {
+            caption: `📕 المعرض ${galleryId} — الجزء ${partNumber}/${totalParts}`
+        });
+    }, CONFIG.uploadRetries, `PDF upload part ${partNumber}`);
+}
+
+async function uploadPhotoGroup(ctx, buffers, galleryId, firstPageNumber) {
+    const media = buffers.map((buffer, index) => ({
+        type: "photo",
+        media: Input.fromBuffer(
+            buffer,
+            `hitomi_${galleryId}_page_${firstPageNumber + index}.jpg`
+        )
+    }));
+
+    await withRetry(
+        () => ctx.replyWithMediaGroup(media),
+        CONFIG.uploadRetries,
+        `Photo group starting page ${firstPageNumber}`
+    );
+}
+
+async function updateProgress(ctx, message, text) {
+    return ctx.telegram.editMessageText(
+        ctx.chat.id,
+        message.message_id,
+        undefined,
+        text
+    ).catch(() => {});
+}
+
+async function processGallery(ctx, galleryId, mode) {
+    if (activeJobs >= 1) {
+        await ctx.reply("هناك عملية أخرى قيد التنفيذ. انتظر حتى تنتهي.");
+        return;
+    }
+
+    activeJobs++;
+    const jobKey = `${ctx.from.id}:${galleryId}:${mode}`;
+    runningJobs.add(jobKey);
+
+    let completed = 0;
+    let failed = 0;
+    let statusMessage = null;
+
+    try {
+        statusMessage = await ctx.reply(`📥 جاري جلب المعرض ${galleryId}...`);
+
+        const { gallery, images } = await retrieveGalleryData(galleryId);
+        const total = images.length;
+        const title = normalizeTitle(gallery);
+
+        await updateProgress(
+            ctx,
+            statusMessage,
+            `📚 ${title}\n🖼️ عدد الصفحات: ${total}\nجاري المعالجة...`
+        );
+
+        if (mode === "photos") {
+            for (let start = 0; start < total; start += CONFIG.photoGroupSize) {
+                const end = Math.min(start + CONFIG.photoGroupSize, total);
+                const group = [];
+
+                for (let i = start; i < end; i++) {
+                    try {
+                        const raw = await fetchImageBuffer(images[i], i + 1);
+                        group.push(await compressImage(raw));
+                        completed++;
+                    } catch (err) {
+                        failed++;
+                        console.error(`Page ${i + 1} failed:`, safeError(err));
+                    }
+
+                    await sleep(CONFIG.requestDelayMs);
+                }
+
+                if (group.length) {
+                    await uploadPhotoGroup(ctx, group, galleryId, start + 1);
+                }
+
+                await updateProgress(
+                    ctx,
+                    statusMessage,
+                    `📥 جاري المعالجة\n` +
+                    `الصفحات: ${Math.min(end, total)}/${total}\n` +
+                    `الناجحة: ${completed}\n` +
+                    `الفاشلة: ${failed}`
+                );
+            }
+        } else {
+            const totalParts = Math.ceil(total / CONFIG.pdfPagesPerPart);
+
+            for (let part = 0; part < totalParts; part++) {
+                const start = part * CONFIG.pdfPagesPerPart;
+                const end = Math.min(start + CONFIG.pdfPagesPerPart, total);
+                const buffers = [];
+
+                for (let i = start; i < end; i++) {
+                    try {
+                        const raw = await fetchImageBuffer(images[i], i + 1);
+                        buffers.push(await compressImage(raw));
+                        completed++;
+                    } catch (err) {
+                        failed++;
+                        console.error(`Page ${i + 1} failed:`, safeError(err));
+                    }
+
+                    await sleep(CONFIG.requestDelayMs);
+                }
+
+                if (buffers.length) {
+                    const pdfBuffer = await createPdf(buffers);
+                    console.log(
+                        `PDF part ${part + 1}/${totalParts}: ` +
+                        `${(pdfBuffer.length / 1024 / 1024).toFixed(2)} MB`
+                    );
+
+                    await uploadPdf(
+                        ctx,
+                        pdfBuffer,
+                        galleryId,
+                        part + 1,
+                        totalParts
+                    );
+                }
+
+                await updateProgress(
+                    ctx,
+                    statusMessage,
+                    `📥 جاري المعالجة\n` +
+                    `الصفحات: ${Math.min(end, total)}/${total}\n` +
+                    `الناجحة: ${completed}\n` +
+                    `الفاشلة: ${failed}\n` +
+                    `الجزء: ${part + 1}/${totalParts}`
+                );
+            }
+        }
+
+        await updateProgress(
+            ctx,
+            statusMessage,
+            `✅ انتهت المعالجة\n` +
+            `المعرض: ${galleryId}\n` +
+            `عدد الصفحات: ${images.length}\n` +
+            `الصور الناجحة: ${completed}\n` +
+            `الصور الفاشلة: ${failed}`
+        );
+    } catch (err) {
+        console.error("Gallery job error:", err);
+        await ctx.reply("❌ تعذرت معالجة المعرض:\n" + safeError(err)).catch(() => {});
+    } finally {
+        activeJobs = Math.max(0, activeJobs - 1);
+        runningJobs.delete(jobKey);
+    }
+}
+
+// Start jobs outside the callback handler so Telegraf does not wait for the
+// entire gallery processing/upload to finish before completing the update.
+bot.action(/^pdf:(\d+)$/, async ctx => {
+    await ctx.answerCbQuery("بدأت المعالجة").catch(() => {});
+    const galleryId = Number(ctx.match[1]);
+
+    if (activeJobs >= 1) {
+        return ctx.reply("هناك عملية أخرى قيد التنفيذ. حاول بعد انتهائها.");
+    }
+
+    processGallery(ctx, galleryId, "pdf").catch(err => {
+        console.error("Background PDF job error:", safeError(err));
+    });
+});
+
+bot.action(/^photos:(\d+)$/, async ctx => {
+    await ctx.answerCbQuery("بدأت المعالجة").catch(() => {});
+    const galleryId = Number(ctx.match[1]);
+
+    if (activeJobs >= 1) {
+        return ctx.reply("هناك عملية أخرى قيد التنفيذ. حاول بعد انتهائها.");
+    }
+
+    processGallery(ctx, galleryId, "photos").catch(err => {
+        console.error("Background photo job error:", safeError(err));
+    });
 });
 
 bot.catch((err, ctx) => {
-  console.error("Telegraf error:", err.message, "update:", ctx.updateType);
+    console.error(
+        "Telegraf error:",
+        safeError(err),
+        "update:",
+        ctx && ctx.updateType
+    );
 });
 
 async function shutdown(signal) {
-  if (shuttingDown) return;
-  shuttingDown = true;
-  console.log(`Received ${signal}; shutting down`);
-  bot.stop(signal);
-  server.close(() => console.log("HTTP server closed"));
-  setTimeout(() => process.exit(0), 5000).unref();
+    if (shuttingDown) return;
+
+    shuttingDown = true;
+    console.log(`Received ${signal}; shutting down`);
+
+    bot.stop(signal);
+
+    server.close(() => {
+        console.log("HTTP server closed");
+    });
+
+    setTimeout(() => process.exit(0), 5000).unref();
 }
 
 process.once("SIGINT", () => shutdown("SIGINT"));
 process.once("SIGTERM", () => shutdown("SIGTERM"));
 
 bot.launch()
-  .then(() => console.log("Telegram bot started"))
-  .catch(err => {
-    console.error("Telegram bot failed:", err);
-    process.exitCode = 1;
-  });
+    .then(() => console.log("Telegram bot started"))
+    .catch(err => {
+        console.error("Telegram bot failed:", err);
+        process.exitCode = 1;
+    });
+'''
+path = "/mnt/data/index.js"
+with open(path, "w", encoding="utf-8") as f:
+    f.write(code)
+print(f"Created {path} ({len(code.splitlines())} lines)")
