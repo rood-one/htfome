@@ -1,4 +1,4 @@
-code = r'''const { Telegraf, Markup, Input } = require("telegraf");
+const { Telegraf, Markup, Input } = require("telegraf");
 const { hitomi, Extension } = require("node-hitomi");
 const sharp = require("sharp");
 const { PDFDocument } = require("pdf-lib");
@@ -32,6 +32,7 @@ const bot = new Telegraf(BOT_TOKEN, { handlerTimeout: 120_000 });
 
 let activeJobs = 0;
 let shuttingDown = false;
+let botStarted = false;
 
 const sessions = new Map();
 const runningJobs = new Set();
@@ -738,7 +739,9 @@ async function shutdown(signal) {
     shuttingDown = true;
     console.log(`Received ${signal}; shutting down`);
 
-    bot.stop(signal);
+    if (botStarted) {
+        bot.stop(signal);
+    }
 
     server.close(() => {
         console.log("HTTP server closed");
@@ -751,13 +754,11 @@ process.once("SIGINT", () => shutdown("SIGINT"));
 process.once("SIGTERM", () => shutdown("SIGTERM"));
 
 bot.launch()
-    .then(() => console.log("Telegram bot started"))
+    .then(() => {
+        botStarted = true;
+        console.log("Telegram bot started");
+    })
     .catch(err => {
         console.error("Telegram bot failed:", err);
         process.exitCode = 1;
     });
-'''
-path = "/mnt/data/index.js"
-with open(path, "w", encoding="utf-8") as f:
-    f.write(code)
-print(f"Created {path} ({len(code.splitlines())} lines)")
