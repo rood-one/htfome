@@ -3,6 +3,11 @@ const { hitomi, Extension } = require("node-hitomi");
 const sharp = require("sharp");
 const { PDFDocument } = require("pdf-lib");
 const http = require("http");
+const https = require("https");
+
+// 1. تحسينات حاسمة لمكتبة sharp لتناسب رام Render المجانية (512MB)
+sharp.cache(false);
+sharp.concurrency(1);
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const OWNER_ID = Number(process.env.OWNER_TELEGRAM_ID);
@@ -16,26 +21,50 @@ if (!Number.isSafeInteger(OWNER_ID) || OWNER_ID <= 0) {
 const CONFIG = {
     maxPagesPerJob: 400,
     maxImageBytes: 25 * 1024 * 1024,
-    targetImageBytes: 120 * 1024,
-    maxWidth: 1400,
+    targetImageBytes: 150 * 1024,
+    maxWidth: 1280,
     downloadRetries: 3,
-    uploadRetries: 3,
+    uploadRetries: 4,
     maxPdfBytes: 45 * 1024 * 1024,
     pdfPagesPerPart: 25,
     photoGroupSize: 10,
     maxSearchResults: 50,
     searchPageSize: 5,
-    requestDelayMs: 150
+    requestDelayMs: 150,
+    sessionTtlMs: 30 * 60 * 1000 // تنظيف الجلسات بعد 30 دقيقة
 };
 
-const bot = new Telegraf(BOT_TOKEN, { handlerTimeout: 120_000 });
+// 2. حل مشكلة socket hang up عبر إجبار IPv4 وضبط المهلة الزمنية للـ Socket
+const telegramAgent = new https.Agent({
+    keepAlive: true,
+    keepAliveMsecs: 10000,
+    family: 4, // إجبار IPv4 لتجنب تعليق الشبكة في حاويات Render
+    timeout: 120000
+});
+
+const bot = new Telegraf(BOT_TOKEN, {
+    handlerTimeout: 120_000,
+    telegram: {
+        agent: telegramAgent,
+        attachmentAgent: telegramAgent
+    }
+});
 
 let activeJobs = 0;
 let shuttingDown = false;
 let botStarted = false;
 
 const sessions = new Map();
-const runningJobs = new Set();
+
+// تنظيف دوري للجلسات لمنع تسرب الذاكرة (Memory Leak)
+setInterval(() => {
+    const now = Date.now();
+    for (const [userId, session] of sessions.entries()) {
+        if (now - session.timestamp > CONFIG.sessionTtlMs) {
+            sessions.delete(userId);
+        }
+    }
+}, 10 * 60 * 1000).unref();
 
 // Render health-check server
 const server = http.createServer((req, res) => {
@@ -49,6 +78,16 @@ server.listen(PORT, "0.0.0.0", () => {
 
 function isOwner(ctx) {
     return Boolean(ctx.from && ctx.from.id === OWNER_ID);
+}
+
+// إخفاء التوكن من أي رسائل خطأ حتى لا يتسرب في الشات أو السجلات
+function safeError(err) {
+    const raw = String((err && (err.message || err)) || "Unknown error");
+    return raw.replace(new RegExp(BOT_TOKEN, "g"), "[REDACTED_TOKEN]").slice(0, 500);
+}
+
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 bot.use(async (ctx, next) => {
@@ -71,14 +110,6 @@ bot.use(async (ctx, next) => {
     }
 });
 
-function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function safeError(err) {
-    return String(err && (err.message || err) || "Unknown error").slice(0, 500);
-}
-
 function extractGalleryId(text) {
     const input = String(text || "").trim();
 
@@ -95,7 +126,8 @@ function extractGalleryId(text) {
             return null;
         }
 
-        const match = url.pathname.match(/^\/reader\/(\d+)\.html$/);
+        const match = url.pathname.match(/\/(?:reader|galleries|manga|doujinshi|cg|gamecg)\/.*?-?(\d+)\.html$/i) ||
+                      url.pathname.match(/^\/reader\/(\d+)\.html$/);
         if (!match) return null;
 
         const id = Number(match[1]);
@@ -106,7 +138,7 @@ function extractGalleryId(text) {
 }
 
 function getCommandQuery(ctx, command) {
-    const text = String(ctx.message && ctx.message.text || "");
+    const text = String((ctx.message && ctx.message.text) || "");
     return text.replace(new RegExp("^\\/" + command + "(?:@\\w+)?\\s*", "i"), "").trim();
 }
 
@@ -121,7 +153,7 @@ function normalizeTitle(item) {
 }
 
 function getGalleryIdFromResult(item) {
-    const raw = item && (item.id || item.galleryid || item.galleryId);
+    const raw = item && (item.id || item.galleryid || item.galleryId || item);
     const id = Number(raw);
     return Number.isSafeInteger(id) && id > 0 ? id : null;
 }
@@ -129,33 +161,22 @@ function getGalleryIdFromResult(item) {
 function normalizeTagSearchTerm(query) {
     return String(query || "")
         .trim()
-        .replace(/\s+/g, "_")
-        .replace(/:/g, ":");
-}
-
-function getTagString(tag) {
-    return String(tag || "").trim();
+        .replace(/\s+/g, "_");
 }
 
 async function searchTagCandidates(query) {
     const term = normalizeTagSearchTerm(query);
     if (!term) return [];
 
-    // node-hitomi 9.2.0 returns [Tag, galleryCount] tuples.
     const raw = await hitomi.tags.search(term);
-
     if (!Array.isArray(raw)) return [];
 
     return raw
         .map(entry => {
             if (!Array.isArray(entry) || !entry[0]) return null;
-
-            const tag = entry[0];
-            const count = Number(entry[1]) || 0;
-
             return {
-                tagText: getTagString(tag),
-                count
+                tagText: String(entry[0] || "").trim(),
+                count: Number(entry[1]) || 0
             };
         })
         .filter(item => item && item.tagText)
@@ -165,7 +186,6 @@ async function searchTagCandidates(query) {
 async function searchGalleriesByTag(tagText) {
     const tags = hitomi.tags.parse(tagText);
     const refs = await hitomi.galleries.list({ tags });
-
     return Array.isArray(refs) ? refs : [];
 }
 
@@ -180,12 +200,7 @@ function makeTagKeyboard(tags, page = 0) {
 
     const rows = current.map((item, index) => {
         const label = `${start + index + 1}. ${item.tagText} (${item.count})`;
-        return [
-            Markup.button.callback(
-                label.slice(0, 60),
-                `tagpick:${start + index}`
-            )
-        ];
+        return [Markup.button.callback(label.slice(0, 60), `tagpick:${start + index}`)];
     });
 
     const navigation = [];
@@ -208,7 +223,8 @@ function makeGalleryKeyboard(results, page = 0) {
         const id = getGalleryIdFromResult(item);
         if (!id) return null;
 
-        const label = `${start + index + 1}. ${normalizeTitle(item)}`;
+        const title = typeof item === "object" ? normalizeTitle(item) : `Gallery #${id}`;
+        const label = `${start + index + 1}. ${title}`;
         return [Markup.button.callback(label.slice(0, 60), `gallery:${id}`)];
     }).filter(Boolean);
 
@@ -234,7 +250,8 @@ async function showTagSearchResults(ctx, query) {
     sessions.set(ctx.from.id, {
         type: "tags",
         query,
-        tags
+        tags,
+        timestamp: Date.now()
     });
 
     return ctx.reply(
@@ -256,7 +273,8 @@ async function showGallerySearchResults(ctx, query, mode, results) {
         type: "galleries",
         query,
         mode,
-        results: valid
+        results: valid,
+        timestamp: Date.now()
     });
 
     return ctx.reply(
@@ -315,11 +333,9 @@ bot.action(/^tagpage:(\d+)$/, async ctx => {
         return ctx.answerCbQuery("انتهت جلسة البحث. ابحث مجددًا.");
     }
 
+    session.timestamp = Date.now();
     await ctx.answerCbQuery();
-
-    return ctx.editMessageReplyMarkup(
-        makeTagKeyboard(session.tags, page).reply_markup
-    ).catch(() => {});
+    return ctx.editMessageReplyMarkup(makeTagKeyboard(session.tags, page).reply_markup).catch(() => {});
 });
 
 bot.action(/^tagpick:(\d+)$/, async ctx => {
@@ -330,6 +346,7 @@ bot.action(/^tagpick:(\d+)$/, async ctx => {
         return ctx.answerCbQuery("انتهت جلسة البحث. ابحث مجددًا.");
     }
 
+    session.timestamp = Date.now();
     await ctx.answerCbQuery("جاري جلب المعارض...");
     const selectedTag = session.tags[index].tagText;
 
@@ -350,11 +367,9 @@ bot.action(/^gallerypage:(\d+)$/, async ctx => {
         return ctx.answerCbQuery("انتهت جلسة البحث. ابحث مجددًا.");
     }
 
+    session.timestamp = Date.now();
     await ctx.answerCbQuery();
-
-    return ctx.editMessageReplyMarkup(
-        makeGalleryKeyboard(session.results, page).reply_markup
-    ).catch(() => {});
+    return ctx.editMessageReplyMarkup(makeGalleryKeyboard(session.results, page).reply_markup).catch(() => {});
 });
 
 bot.action(/^gallery:(\d+)$/, async ctx => {
@@ -398,13 +413,14 @@ async function withRetry(fn, retries = CONFIG.downloadRetries, label = "operatio
             return await fn();
         } catch (err) {
             lastError = err;
-            console.error(
-                `${label} failed (${attempt}/${retries}):`,
-                safeError(err)
-            );
+            console.error(`${label} failed (${attempt}/${retries}):`, safeError(err));
 
-            if (attempt < retries) {
-                await sleep(Math.min(2000 * attempt, 8000));
+            // معالجة ذكية لحدود تليجرام الزمنية (429 Too Many Requests)
+            const retryAfter = err?.response?.parameters?.retry_after;
+            if (retryAfter) {
+                await sleep((retryAfter + 1) * 1000);
+            } else if (attempt < retries) {
+                await sleep(Math.min(2500 * attempt, 10000));
             }
         }
     }
@@ -421,8 +437,6 @@ async function retrieveGalleryData(galleryId) {
 
     if (!gallery) throw new Error("لم يتم العثور على المعرض");
 
-    // node-hitomi 9.2.0: gallery.files contains the full image list.
-    // getThumbnails() returns representative thumbnails, not all pages.
     const images = gallery.files;
 
     if (!Array.isArray(images) || images.length === 0) {
@@ -430,9 +444,7 @@ async function retrieveGalleryData(galleryId) {
     }
 
     if (images.length > CONFIG.maxPagesPerJob) {
-        throw new Error(
-            `المعرض يحتوي على ${images.length} صفحة. الحد الحالي ${CONFIG.maxPagesPerJob}.`
-        );
+        throw new Error(`المعرض يحتوي على ${images.length} صفحة. الحد الحالي ${CONFIG.maxPagesPerJob}.`);
     }
 
     return { gallery, images };
@@ -458,76 +470,56 @@ async function fetchImageBuffer(image, pageNumber) {
     return buffer;
 }
 
+// 3. ضغط سريع بحد أقصى محاولتين بدلاً من 12 محاولة لتجنب استنزاف المعالج والرام
 async function compressImage(input) {
-    let metadata = await sharp(input, { limitInputPixels: 40_000_000 }).metadata();
+    const firstPass = await sharp(input, { limitInputPixels: 40_000_000 })
+        .rotate()
+        .resize({ width: CONFIG.maxWidth, withoutEnlargement: true })
+        .flatten({ background: "#ffffff" })
+        .jpeg({ quality: 72, mozjpeg: true })
+        .toBuffer({ resolveWithObject: true });
 
-    if (!metadata.width || !metadata.height) {
-        throw new Error("تعذر قراءة أبعاد الصورة");
+    if (firstPass.data.length <= CONFIG.targetImageBytes) {
+        return {
+            buffer: firstPass.data,
+            width: firstPass.info.width,
+            height: firstPass.info.height
+        };
     }
 
-    let width = Math.min(metadata.width, CONFIG.maxWidth);
-    let quality = 78;
-    let best = null;
+    // محاولة ثانية وأخيرة فقط إذا كانت الصورة لا تزال كبيرة
+    const secondPass = await sharp(firstPass.data)
+        .resize({ width: 960, withoutEnlargement: true })
+        .jpeg({ quality: 55, mozjpeg: true })
+        .toBuffer({ resolveWithObject: true });
 
-    for (let attempt = 0; attempt < 12; attempt++) {
-        const output = await sharp(input, { limitInputPixels: 40_000_000 })
-            .rotate()
-            .resize({ width, withoutEnlargement: true })
-            .flatten({ background: "#ffffff" })
-            .jpeg({
-                quality,
-                mozjpeg: true,
-                progressive: true
-            })
-            .toBuffer();
-
-        if (!best || output.length < best.length) {
-            best = output;
-        }
-
-        if (output.length <= CONFIG.targetImageBytes) {
-            return output;
-        }
-
-        if (quality > 42) {
-            quality -= 7;
-        } else {
-            width = Math.max(450, Math.floor(width * 0.85));
-            quality = 65;
-        }
-    }
-
-    if (best) return best;
-    throw new Error("تعذر ضغط الصورة");
+    return {
+        buffer: secondPass.data,
+        width: secondPass.info.width,
+        height: secondPass.info.height
+    };
 }
 
-async function createPdf(imageBuffers) {
+// 4. إنشاء الـ PDF مباشرة من الصور المضغوطة بدون إعادة تشغيل sharp مرة أخرى
+async function createPdf(processedImages) {
     const pdf = await PDFDocument.create();
 
-    for (let index = 0; index < imageBuffers.length; index++) {
-        const jpegBuffer = await sharp(imageBuffers[index])
-            .jpeg({ quality: 82, mozjpeg: true })
-            .toBuffer();
+    for (const img of processedImages) {
+        const embedded = await pdf.embedJpg(img.buffer);
+        const page = pdf.addPage([img.width || 800, img.height || 1200]);
 
-        const metadata = await sharp(jpegBuffer).metadata();
-        const width = metadata.width || 800;
-        const height = metadata.height || 1200;
-
-        const image = await pdf.embedJpg(jpegBuffer);
-        const page = pdf.addPage([width, height]);
-
-        page.drawImage(image, {
+        page.drawImage(embedded, {
             x: 0,
             y: 0,
-            width,
-            height
+            width: img.width || 800,
+            height: img.height || 1200
         });
     }
 
     return Buffer.from(await pdf.save({ useObjectStreams: true }));
 }
 
-async function uploadPdf(ctx, pdfBuffer, galleryId, partNumber, totalParts) {
+async function uploadPdf(chatId, pdfBuffer, galleryId, partNumber, totalParts) {
     if (pdfBuffer.length > CONFIG.maxPdfBytes) {
         throw new Error(
             `حجم PDF (${(pdfBuffer.length / 1024 / 1024).toFixed(1)} MB) تجاوز حد البوت الآمن.`
@@ -540,61 +532,53 @@ async function uploadPdf(ctx, pdfBuffer, galleryId, partNumber, totalParts) {
             `hitomi_${galleryId}_part_${partNumber}.pdf`
         );
 
-        await ctx.replyWithDocument(file, {
+        await bot.telegram.sendDocument(chatId, file, {
             caption: `📕 المعرض ${galleryId} — الجزء ${partNumber}/${totalParts}`
         });
     }, CONFIG.uploadRetries, `PDF upload part ${partNumber}`);
 }
 
-async function uploadPhotoGroup(ctx, buffers, galleryId, firstPageNumber) {
-    const media = buffers.map((buffer, index) => ({
+async function uploadPhotoGroup(chatId, processedImages, galleryId, firstPageNumber) {
+    const media = processedImages.map((img, index) => ({
         type: "photo",
         media: Input.fromBuffer(
-            buffer,
+            img.buffer,
             `hitomi_${galleryId}_page_${firstPageNumber + index}.jpg`
         )
     }));
 
     await withRetry(
-        () => ctx.replyWithMediaGroup(media),
+        () => bot.telegram.sendMediaGroup(chatId, media),
         CONFIG.uploadRetries,
         `Photo group starting page ${firstPageNumber}`
     );
 }
 
-async function updateProgress(ctx, message, text) {
-    return ctx.telegram.editMessageText(
-        ctx.chat.id,
-        message.message_id,
-        undefined,
-        text
-    ).catch(() => {});
+async function updateProgress(chatId, messageId, text) {
+    return bot.telegram.editMessageText(chatId, messageId, undefined, text).catch(() => {});
 }
 
-async function processGallery(ctx, galleryId, mode) {
+async function processGallery(chatId, galleryId, mode) {
     if (activeJobs >= 1) {
-        await ctx.reply("هناك عملية أخرى قيد التنفيذ. انتظر حتى تنتهي.");
+        await bot.telegram.sendMessage(chatId, "هناك عملية أخرى قيد التنفيذ. انتظر حتى تنتهي.");
         return;
     }
 
     activeJobs++;
-    const jobKey = `${ctx.from.id}:${galleryId}:${mode}`;
-    runningJobs.add(jobKey);
-
     let completed = 0;
     let failed = 0;
     let statusMessage = null;
 
     try {
-        statusMessage = await ctx.reply(`📥 جاري جلب المعرض ${galleryId}...`);
+        statusMessage = await bot.telegram.sendMessage(chatId, `📥 جاري جلب المعرض ${galleryId}...`);
 
         const { gallery, images } = await retrieveGalleryData(galleryId);
         const total = images.length;
         const title = normalizeTitle(gallery);
 
         await updateProgress(
-            ctx,
-            statusMessage,
+            chatId,
+            statusMessage.message_id,
             `📚 ${title}\n🖼️ عدد الصفحات: ${total}\nجاري المعالجة...`
         );
 
@@ -617,12 +601,12 @@ async function processGallery(ctx, galleryId, mode) {
                 }
 
                 if (group.length) {
-                    await uploadPhotoGroup(ctx, group, galleryId, start + 1);
+                    await uploadPhotoGroup(chatId, group, galleryId, start + 1);
                 }
 
                 await updateProgress(
-                    ctx,
-                    statusMessage,
+                    chatId,
+                    statusMessage.message_id,
                     `📥 جاري المعالجة\n` +
                     `الصفحات: ${Math.min(end, total)}/${total}\n` +
                     `الناجحة: ${completed}\n` +
@@ -635,12 +619,12 @@ async function processGallery(ctx, galleryId, mode) {
             for (let part = 0; part < totalParts; part++) {
                 const start = part * CONFIG.pdfPagesPerPart;
                 const end = Math.min(start + CONFIG.pdfPagesPerPart, total);
-                const buffers = [];
+                const processedBatch = [];
 
                 for (let i = start; i < end; i++) {
                     try {
                         const raw = await fetchImageBuffer(images[i], i + 1);
-                        buffers.push(await compressImage(raw));
+                        processedBatch.push(await compressImage(raw));
                         completed++;
                     } catch (err) {
                         failed++;
@@ -650,15 +634,18 @@ async function processGallery(ctx, galleryId, mode) {
                     await sleep(CONFIG.requestDelayMs);
                 }
 
-                if (buffers.length) {
-                    const pdfBuffer = await createPdf(buffers);
+                if (processedBatch.length) {
+                    const pdfBuffer = await createPdf(processedBatch);
+                    // تفريغ المصفوفة فوراً لمساعدة Garbage Collector على تحرير الرام قبل الرفع
+                    processedBatch.length = 0;
+
                     console.log(
                         `PDF part ${part + 1}/${totalParts}: ` +
                         `${(pdfBuffer.length / 1024 / 1024).toFixed(2)} MB`
                     );
 
                     await uploadPdf(
-                        ctx,
+                        chatId,
                         pdfBuffer,
                         galleryId,
                         part + 1,
@@ -667,8 +654,8 @@ async function processGallery(ctx, galleryId, mode) {
                 }
 
                 await updateProgress(
-                    ctx,
-                    statusMessage,
+                    chatId,
+                    statusMessage.message_id,
                     `📥 جاري المعالجة\n` +
                     `الصفحات: ${Math.min(end, total)}/${total}\n` +
                     `الناجحة: ${completed}\n` +
@@ -679,8 +666,8 @@ async function processGallery(ctx, galleryId, mode) {
         }
 
         await updateProgress(
-            ctx,
-            statusMessage,
+            chatId,
+            statusMessage.message_id,
             `✅ انتهت المعالجة\n` +
             `المعرض: ${galleryId}\n` +
             `عدد الصفحات: ${images.length}\n` +
@@ -688,25 +675,23 @@ async function processGallery(ctx, galleryId, mode) {
             `الصور الفاشلة: ${failed}`
         );
     } catch (err) {
-        console.error("Gallery job error:", err);
-        await ctx.reply("❌ تعذرت معالجة المعرض:\n" + safeError(err)).catch(() => {});
+        console.error("Gallery job error:", safeError(err));
+        await bot.telegram.sendMessage(chatId, "❌ تعذرت معالجة المعرض:\n" + safeError(err)).catch(() => {});
     } finally {
         activeJobs = Math.max(0, activeJobs - 1);
-        runningJobs.delete(jobKey);
     }
 }
 
-// Start jobs outside the callback handler so Telegraf does not wait for the
-// entire gallery processing/upload to finish before completing the update.
 bot.action(/^pdf:(\d+)$/, async ctx => {
     await ctx.answerCbQuery("بدأت المعالجة").catch(() => {});
     const galleryId = Number(ctx.match[1]);
+    const chatId = ctx.chat.id;
 
     if (activeJobs >= 1) {
         return ctx.reply("هناك عملية أخرى قيد التنفيذ. حاول بعد انتهائها.");
     }
 
-    processGallery(ctx, galleryId, "pdf").catch(err => {
+    processGallery(chatId, galleryId, "pdf").catch(err => {
         console.error("Background PDF job error:", safeError(err));
     });
 });
@@ -714,23 +699,19 @@ bot.action(/^pdf:(\d+)$/, async ctx => {
 bot.action(/^photos:(\d+)$/, async ctx => {
     await ctx.answerCbQuery("بدأت المعالجة").catch(() => {});
     const galleryId = Number(ctx.match[1]);
+    const chatId = ctx.chat.id;
 
     if (activeJobs >= 1) {
         return ctx.reply("هناك عملية أخرى قيد التنفيذ. حاول بعد انتهائها.");
     }
 
-    processGallery(ctx, galleryId, "photos").catch(err => {
+    processGallery(chatId, galleryId, "photos").catch(err => {
         console.error("Background photo job error:", safeError(err));
     });
 });
 
 bot.catch((err, ctx) => {
-    console.error(
-        "Telegraf error:",
-        safeError(err),
-        "update:",
-        ctx && ctx.updateType
-    );
+    console.error("Telegraf error:", safeError(err), "update:", ctx && ctx.updateType);
 });
 
 async function shutdown(signal) {
@@ -753,12 +734,12 @@ async function shutdown(signal) {
 process.once("SIGINT", () => shutdown("SIGINT"));
 process.once("SIGTERM", () => shutdown("SIGTERM"));
 
-bot.launch()
+bot.launch({ dropPendingUpdates: true })
     .then(() => {
         botStarted = true;
         console.log("Telegram bot started");
     })
     .catch(err => {
-        console.error("Telegram bot failed:", err);
+        console.error("Telegram bot failed:", safeError(err));
         process.exitCode = 1;
     });
