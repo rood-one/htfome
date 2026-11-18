@@ -1,11 +1,17 @@
+const dns = require("dns");
+// 1. إجبار Node.js على تفضيل IPv4 لحل مشكلة socket hang up على Render
+if (typeof dns.setDefaultResultOrder === "function") {
+    dns.setDefaultResultOrder("ipv4first");
+}
+
+const https = require("https");
+const http = require("http");
 const { Telegraf, Markup, Input } = require("telegraf");
 const { hitomi, Extension } = require("node-hitomi");
 const sharp = require("sharp");
 const { PDFDocument } = require("pdf-lib");
-const http = require("http");
-const https = require("https");
 
-// 1. تحسينات حاسمة لمكتبة sharp لتناسب رام Render المجانية (512MB)
+// 2. ضبط sharp ليتناسب مع رام Render المجانية (512MB) ومعالج 0.1 CPU
 sharp.cache(false);
 sharp.concurrency(1);
 
@@ -30,23 +36,22 @@ const CONFIG = {
     photoGroupSize: 10,
     maxSearchResults: 50,
     searchPageSize: 5,
-    requestDelayMs: 150,
-    sessionTtlMs: 30 * 60 * 1000 // تنظيف الجلسات بعد 30 دقيقة
+    requestDelayMs: 200
 };
 
-// 2. حل مشكلة socket hang up عبر إجبار IPv4 وضبط المهلة الزمنية للـ Socket
+// 3. إعداد Agent مخصص يجبر الاتصال على IPv4 ويمنع تعليق الـ Sockets الميتة
 const telegramAgent = new https.Agent({
-    keepAlive: true,
-    keepAliveMsecs: 10000,
-    family: 4, // إجبار IPv4 لتجنب تعليق الشبكة في حاويات Render
-    timeout: 120000
+    keepAlive: false, // يمنع إعادة استخدام Socket أغلقه سيرفر تليجرام أثناء ضغط الصور
+    family: 4,        // إجبار IPv4
+    timeout: 120_000
 });
 
 const bot = new Telegraf(BOT_TOKEN, {
-    handlerTimeout: 120_000,
+    handlerTimeout: 180_000,
     telegram: {
         agent: telegramAgent,
-        attachmentAgent: telegramAgent
+        attachmentAgent: telegramAgent,
+        apiTimeout: 120_000
     }
 });
 
@@ -55,16 +60,7 @@ let shuttingDown = false;
 let botStarted = false;
 
 const sessions = new Map();
-
-// تنظيف دوري للجلسات لمنع تسرب الذاكرة (Memory Leak)
-setInterval(() => {
-    const now = Date.now();
-    for (const [userId, session] of sessions.entries()) {
-        if (now - session.timestamp > CONFIG.sessionTtlMs) {
-            sessions.delete(userId);
-        }
-    }
-}, 10 * 60 * 1000).unref();
+const runningJobs = new Set();
 
 // Render health-check server
 const server = http.createServer((req, res) => {
@@ -78,16 +74,6 @@ server.listen(PORT, "0.0.0.0", () => {
 
 function isOwner(ctx) {
     return Boolean(ctx.from && ctx.from.id === OWNER_ID);
-}
-
-// إخفاء التوكن من أي رسائل خطأ حتى لا يتسرب في الشات أو السجلات
-function safeError(err) {
-    const raw = String((err && (err.message || err)) || "Unknown error");
-    return raw.replace(new RegExp(BOT_TOKEN, "g"), "[REDACTED_TOKEN]").slice(0, 500);
-}
-
-function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 bot.use(async (ctx, next) => {
@@ -110,6 +96,14 @@ bot.use(async (ctx, next) => {
     }
 });
 
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function safeError(err) {
+    return String((err && (err.message || err)) || "Unknown error").slice(0, 500);
+}
+
 function extractGalleryId(text) {
     const input = String(text || "").trim();
 
@@ -126,8 +120,8 @@ function extractGalleryId(text) {
             return null;
         }
 
-        const match = url.pathname.match(/\/(?:reader|galleries|manga|doujinshi|cg|gamecg)\/.*?-?(\d+)\.html$/i) ||
-                      url.pathname.match(/^\/reader\/(\d+)\.html$/);
+        const match = url.pathname.match(/^\/(?:reader|galleries|manga|doujinshi|cg|gamecg)\/.*?(?:(\d+))\.html$/i) ||
+                      url.pathname.match(/^\/reader\/(\d+)\.html$/i);
         if (!match) return null;
 
         const id = Number(match[1]);
@@ -153,7 +147,7 @@ function normalizeTitle(item) {
 }
 
 function getGalleryIdFromResult(item) {
-    const raw = item && (item.id || item.galleryid || item.galleryId || item);
+    const raw = item && (item.id || item.galleryid || item.galleryId);
     const id = Number(raw);
     return Number.isSafeInteger(id) && id > 0 ? id : null;
 }
@@ -161,7 +155,12 @@ function getGalleryIdFromResult(item) {
 function normalizeTagSearchTerm(query) {
     return String(query || "")
         .trim()
-        .replace(/\s+/g, "_");
+        .replace(/\s+/g, "_")
+        .replace(/:/g, ":");
+}
+
+function getTagString(tag) {
+    return String(tag || "").trim();
 }
 
 async function searchTagCandidates(query) {
@@ -175,7 +174,7 @@ async function searchTagCandidates(query) {
         .map(entry => {
             if (!Array.isArray(entry) || !entry[0]) return null;
             return {
-                tagText: String(entry[0] || "").trim(),
+                tagText: getTagString(entry[0]),
                 count: Number(entry[1]) || 0
             };
         })
@@ -219,14 +218,14 @@ function makeGalleryKeyboard(results, page = 0) {
     const start = page * CONFIG.searchPageSize;
     const current = results.slice(start, start + CONFIG.searchPageSize);
 
-    const rows = current.map((item, index) => {
-        const id = getGalleryIdFromResult(item);
-        if (!id) return null;
-
-        const title = typeof item === "object" ? normalizeTitle(item) : `Gallery #${id}`;
-        const label = `${start + index + 1}. ${title}`;
-        return [Markup.button.callback(label.slice(0, 60), `gallery:${id}`)];
-    }).filter(Boolean);
+    const rows = current
+        .map((item, index) => {
+            const id = getGalleryIdFromResult(item);
+            if (!id) return null;
+            const label = `${start + index + 1}. ${normalizeTitle(item)}`;
+            return [Markup.button.callback(label.slice(0, 60), `gallery:${id}`)];
+        })
+        .filter(Boolean);
 
     const navigation = [];
     if (page > 0) {
@@ -242,7 +241,6 @@ function makeGalleryKeyboard(results, page = 0) {
 
 async function showTagSearchResults(ctx, query) {
     const tags = await searchTagCandidates(query);
-
     if (!tags.length) {
         return ctx.reply("لم أجد تاغات مطابقة. جرّب كلمة أخرى.");
     }
@@ -251,7 +249,7 @@ async function showTagSearchResults(ctx, query) {
         type: "tags",
         query,
         tags,
-        timestamp: Date.now()
+        updatedAt: Date.now()
     });
 
     return ctx.reply(
@@ -274,7 +272,7 @@ async function showGallerySearchResults(ctx, query, mode, results) {
         query,
         mode,
         results: valid,
-        timestamp: Date.now()
+        updatedAt: Date.now()
     });
 
     return ctx.reply(
@@ -283,20 +281,24 @@ async function showGallerySearchResults(ctx, query, mode, results) {
     );
 }
 
-bot.start(ctx => ctx.reply(
-    "أهلًا بك.\n\n" +
-    "/search blue archive - البحث عن التاغات\n" +
-    "/title blue archive - البحث بالعنوان\n" +
-    "/view 1916532 - فتح معرض بالمعرف\n\n" +
-    "أرسل رابط Hitomi لتحويل المعرض إلى PDF أو صور."
-));
+bot.start(ctx =>
+    ctx.reply(
+        "أهلًا بك.\n\n" +
+        "/search blue archive - البحث عن التاغات\n" +
+        "/title blue archive - البحث بالعنوان\n" +
+        "/view 1916532 - فتح معرض بالمعرف\n\n" +
+        "أرسل رابط Hitomi لتحويل المعرض إلى PDF أو صور."
+    )
+);
 
-bot.help(ctx => ctx.reply(
-    "/search كلمة البحث\n" +
-    "/title اسم المعرض\n" +
-    "/view معرف المعرض\n\n" +
-    "يمكنك أيضًا إرسال رابط المعرض مباشرة."
-));
+bot.help(ctx =>
+    ctx.reply(
+        "/search كلمة البحث\n" +
+        "/title اسم المعرض\n" +
+        "/view معرف المعرض\n\n" +
+        "يمكنك أيضًا إرسال رابط المعرض مباشرة."
+    )
+);
 
 bot.command("search", async ctx => {
     const query = getCommandQuery(ctx, "search");
@@ -333,7 +335,6 @@ bot.action(/^tagpage:(\d+)$/, async ctx => {
         return ctx.answerCbQuery("انتهت جلسة البحث. ابحث مجددًا.");
     }
 
-    session.timestamp = Date.now();
     await ctx.answerCbQuery();
     return ctx.editMessageReplyMarkup(makeTagKeyboard(session.tags, page).reply_markup).catch(() => {});
 });
@@ -346,7 +347,6 @@ bot.action(/^tagpick:(\d+)$/, async ctx => {
         return ctx.answerCbQuery("انتهت جلسة البحث. ابحث مجددًا.");
     }
 
-    session.timestamp = Date.now();
     await ctx.answerCbQuery("جاري جلب المعارض...");
     const selectedTag = session.tags[index].tagText;
 
@@ -367,7 +367,6 @@ bot.action(/^gallerypage:(\d+)$/, async ctx => {
         return ctx.answerCbQuery("انتهت جلسة البحث. ابحث مجددًا.");
     }
 
-    session.timestamp = Date.now();
     await ctx.answerCbQuery();
     return ctx.editMessageReplyMarkup(makeGalleryKeyboard(session.results, page).reply_markup).catch(() => {});
 });
@@ -413,13 +412,17 @@ async function withRetry(fn, retries = CONFIG.downloadRetries, label = "operatio
             return await fn();
         } catch (err) {
             lastError = err;
-            console.error(`${label} failed (${attempt}/${retries}):`, safeError(err));
+            const errMsg = safeError(err);
+            console.error(`${label} failed (${attempt}/${retries}):`, errMsg);
 
-            // معالجة ذكية لحدود تليجرام الزمنية (429 Too Many Requests)
-            const retryAfter = err?.response?.parameters?.retry_after;
+            // التعامل مع Rate Limit الخاص بتليجرام (429 Too Many Requests)
+            const retryAfter = err && err.response && err.response.parameters && err.response.parameters.retry_after;
             if (retryAfter) {
-                await sleep((retryAfter + 1) * 1000);
-            } else if (attempt < retries) {
+                await sleep((Number(retryAfter) + 1) * 1000);
+                continue;
+            }
+
+            if (attempt < retries) {
                 await sleep(Math.min(2500 * attempt, 10000));
             }
         }
@@ -438,7 +441,6 @@ async function retrieveGalleryData(galleryId) {
     if (!gallery) throw new Error("لم يتم العثور على المعرض");
 
     const images = gallery.files;
-
     if (!Array.isArray(images) || images.length === 0) {
         throw new Error("لم يتم العثور على صفحات المعرض (gallery.files فارغة).");
     }
@@ -458,11 +460,9 @@ async function fetchImageBuffer(image, pageNumber) {
     );
 
     const buffer = Buffer.from(data);
-
     if (!buffer.length) {
         throw new Error(`الصورة ${pageNumber} فارغة`);
     }
-
     if (buffer.length > CONFIG.maxImageBytes) {
         throw new Error(`حجم الصورة ${pageNumber} كبير جدًا`);
     }
@@ -470,49 +470,55 @@ async function fetchImageBuffer(image, pageNumber) {
     return buffer;
 }
 
-// 3. ضغط سريع بحد أقصى محاولتين بدلاً من 12 محاولة لتجنب استنزاف المعالج والرام
+/**
+ * 4. ضغط الصورة بخطوة أو خطوتين كحد أقصى بدلاً من 12 محاولة تستهلك المعالج والرام،
+ * مع إرجاع الأبعاد مباشرة لتجنب فك تشفير الصورة مجدداً داخل createPdf.
+ */
 async function compressImage(input) {
-    const firstPass = await sharp(input, { limitInputPixels: 40_000_000 })
+    const pipeline = sharp(input, { limitInputPixels: 40_000_000 })
         .rotate()
         .resize({ width: CONFIG.maxWidth, withoutEnlargement: true })
-        .flatten({ background: "#ffffff" })
-        .jpeg({ quality: 72, mozjpeg: true })
+        .flatten({ background: "#ffffff" });
+
+    let { data, info } = await pipeline
+        .jpeg({ quality: 72, mozjpeg: true, progressive: true })
         .toBuffer({ resolveWithObject: true });
 
-    if (firstPass.data.length <= CONFIG.targetImageBytes) {
-        return {
-            buffer: firstPass.data,
-            width: firstPass.info.width,
-            height: firstPass.info.height
-        };
+    // إذا كان الحجم لا يزال كبيراً جداً، نقوم بتمريرة ثانية سريعة وأخيرة
+    if (data.length > CONFIG.targetImageBytes * 1.6) {
+        const smallerWidth = Math.max(600, Math.floor((info.width || CONFIG.maxWidth) * 0.78));
+        const secondPass = await sharp(data)
+            .resize({ width: smallerWidth, withoutEnlargement: true })
+            .jpeg({ quality: 55, mozjpeg: true, progressive: true })
+            .toBuffer({ resolveWithObject: true });
+
+        data = secondPass.data;
+        info = secondPass.info;
     }
 
-    // محاولة ثانية وأخيرة فقط إذا كانت الصورة لا تزال كبيرة
-    const secondPass = await sharp(firstPass.data)
-        .resize({ width: 960, withoutEnlargement: true })
-        .jpeg({ quality: 55, mozjpeg: true })
-        .toBuffer({ resolveWithObject: true });
-
     return {
-        buffer: secondPass.data,
-        width: secondPass.info.width,
-        height: secondPass.info.height
+        buffer: data,
+        width: info.width || 800,
+        height: info.height || 1200
     };
 }
 
-// 4. إنشاء الـ PDF مباشرة من الصور المضغوطة بدون إعادة تشغيل sharp مرة أخرى
+/**
+ * 5. إنشاء الـ PDF مباشرة من الـ JPEG Buffers المضغوطة دون استدعاء sharp مرة أخرى!
+ */
 async function createPdf(processedImages) {
     const pdf = await PDFDocument.create();
 
-    for (const img of processedImages) {
-        const embedded = await pdf.embedJpg(img.buffer);
-        const page = pdf.addPage([img.width || 800, img.height || 1200]);
+    for (let index = 0; index < processedImages.length; index++) {
+        const { buffer, width, height } = processedImages[index];
+        const image = await pdf.embedJpg(buffer);
+        const page = pdf.addPage([width, height]);
 
-        page.drawImage(embedded, {
+        page.drawImage(image, {
             x: 0,
             y: 0,
-            width: img.width || 800,
-            height: img.height || 1200
+            width,
+            height
         });
     }
 
@@ -555,16 +561,21 @@ async function uploadPhotoGroup(chatId, processedImages, galleryId, firstPageNum
 }
 
 async function updateProgress(chatId, messageId, text) {
-    return bot.telegram.editMessageText(chatId, messageId, undefined, text).catch(() => {});
+    return bot.telegram
+        .editMessageText(chatId, messageId, undefined, text)
+        .catch(() => {});
 }
 
-async function processGallery(chatId, galleryId, mode) {
+async function processGallery(chatId, userId, galleryId, mode) {
     if (activeJobs >= 1) {
-        await bot.telegram.sendMessage(chatId, "هناك عملية أخرى قيد التنفيذ. انتظر حتى تنتهي.");
+        await bot.telegram.sendMessage(chatId, "هناك عملية أخرى قيد التنفيذ. انتظر حتى تنتهي.").catch(() => {});
         return;
     }
 
     activeJobs++;
+    const jobKey = `${userId}:${galleryId}:${mode}`;
+    runningJobs.add(jobKey);
+
     let completed = 0;
     let failed = 0;
     let statusMessage = null;
@@ -590,7 +601,8 @@ async function processGallery(chatId, galleryId, mode) {
                 for (let i = start; i < end; i++) {
                     try {
                         const raw = await fetchImageBuffer(images[i], i + 1);
-                        group.push(await compressImage(raw));
+                        const compressed = await compressImage(raw);
+                        group.push(compressed);
                         completed++;
                     } catch (err) {
                         failed++;
@@ -602,6 +614,7 @@ async function processGallery(chatId, galleryId, mode) {
 
                 if (group.length) {
                     await uploadPhotoGroup(chatId, group, galleryId, start + 1);
+                    group.length = 0; // تحرير الرام فوراً
                 }
 
                 await updateProgress(
@@ -619,12 +632,13 @@ async function processGallery(chatId, galleryId, mode) {
             for (let part = 0; part < totalParts; part++) {
                 const start = part * CONFIG.pdfPagesPerPart;
                 const end = Math.min(start + CONFIG.pdfPagesPerPart, total);
-                const processedBatch = [];
+                const processedImages = [];
 
                 for (let i = start; i < end; i++) {
                     try {
                         const raw = await fetchImageBuffer(images[i], i + 1);
-                        processedBatch.push(await compressImage(raw));
+                        const compressed = await compressImage(raw);
+                        processedImages.push(compressed);
                         completed++;
                     } catch (err) {
                         failed++;
@@ -634,10 +648,9 @@ async function processGallery(chatId, galleryId, mode) {
                     await sleep(CONFIG.requestDelayMs);
                 }
 
-                if (processedBatch.length) {
-                    const pdfBuffer = await createPdf(processedBatch);
-                    // تفريغ المصفوفة فوراً لمساعدة Garbage Collector على تحرير الرام قبل الرفع
-                    processedBatch.length = 0;
+                if (processedImages.length) {
+                    const pdfBuffer = await createPdf(processedImages);
+                    processedImages.length = 0; // تحرير صور الجزء من الرام قبل الرفع
 
                     console.log(
                         `PDF part ${part + 1}/${totalParts}: ` +
@@ -675,23 +688,28 @@ async function processGallery(chatId, galleryId, mode) {
             `الصور الفاشلة: ${failed}`
         );
     } catch (err) {
-        console.error("Gallery job error:", safeError(err));
-        await bot.telegram.sendMessage(chatId, "❌ تعذرت معالجة المعرض:\n" + safeError(err)).catch(() => {});
+        console.error("Gallery job error:", err);
+        await bot.telegram
+            .sendMessage(chatId, "❌ تعذرت معالجة المعرض:\n" + safeError(err))
+            .catch(() => {});
     } finally {
         activeJobs = Math.max(0, activeJobs - 1);
+        runningJobs.delete(jobKey);
     }
 }
 
 bot.action(/^pdf:(\d+)$/, async ctx => {
     await ctx.answerCbQuery("بدأت المعالجة").catch(() => {});
     const galleryId = Number(ctx.match[1]);
-    const chatId = ctx.chat.id;
 
     if (activeJobs >= 1) {
         return ctx.reply("هناك عملية أخرى قيد التنفيذ. حاول بعد انتهائها.");
     }
 
-    processGallery(chatId, galleryId, "pdf").catch(err => {
+    const chatId = ctx.chat.id;
+    const userId = ctx.from.id;
+
+    processGallery(chatId, userId, galleryId, "pdf").catch(err => {
         console.error("Background PDF job error:", safeError(err));
     });
 });
@@ -699,19 +717,26 @@ bot.action(/^pdf:(\d+)$/, async ctx => {
 bot.action(/^photos:(\d+)$/, async ctx => {
     await ctx.answerCbQuery("بدأت المعالجة").catch(() => {});
     const galleryId = Number(ctx.match[1]);
-    const chatId = ctx.chat.id;
 
     if (activeJobs >= 1) {
         return ctx.reply("هناك عملية أخرى قيد التنفيذ. حاول بعد انتهائها.");
     }
 
-    processGallery(chatId, galleryId, "photos").catch(err => {
+    const chatId = ctx.chat.id;
+    const userId = ctx.from.id;
+
+    processGallery(chatId, userId, galleryId, "photos").catch(err => {
         console.error("Background photo job error:", safeError(err));
     });
 });
 
 bot.catch((err, ctx) => {
-    console.error("Telegraf error:", safeError(err), "update:", ctx && ctx.updateType);
+    console.error(
+        "Telegraf error:",
+        safeError(err),
+        "update:",
+        ctx && ctx.updateType
+    );
 });
 
 async function shutdown(signal) {
@@ -740,6 +765,6 @@ bot.launch({ dropPendingUpdates: true })
         console.log("Telegram bot started");
     })
     .catch(err => {
-        console.error("Telegram bot failed:", safeError(err));
+        console.error("Telegram bot failed:", err);
         process.exitCode = 1;
     });
