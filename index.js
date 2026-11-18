@@ -533,32 +533,65 @@ async function uploadPdf(chatId, pdfBuffer, galleryId, partNumber, totalParts) {
     }
 
     await withRetry(async () => {
-        const file = Input.fromBuffer(
-            pdfBuffer,
+        const form = new FormData();
+        form.append("chat_id", String(chatId));
+        form.append("caption", `📕 المعرض ${galleryId} — الجزء ${partNumber}/${totalParts}`);
+        form.append(
+            "document",
+            new Blob([pdfBuffer], { type: "application/pdf" }),
             `hitomi_${galleryId}_part_${partNumber}.pdf`
         );
 
-        await bot.telegram.sendDocument(chatId, file, {
-            caption: `📕 المعرض ${galleryId} — الجزء ${partNumber}/${totalParts}`
+        const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendDocument`, {
+            method: "POST",
+            body: form,
+            signal: AbortSignal.timeout(120_000)
         });
+
+        const data = await res.json();
+        if (!res.ok || !data.ok) {
+            const err = new Error(data.description || `HTTP ${res.status}`);
+            err.response = data; // لكي تلتقطها دالة withRetry في حال وجود retry_after
+            throw err;
+        }
     }, CONFIG.uploadRetries, `PDF upload part ${partNumber}`);
 }
 
 async function uploadPhotoGroup(chatId, processedImages, galleryId, firstPageNumber) {
-    const media = processedImages.map((img, index) => ({
-        type: "photo",
-        media: Input.fromBuffer(
-            img.buffer,
-            `hitomi_${galleryId}_page_${firstPageNumber + index}.jpg`
-        )
-    }));
+    await withRetry(async () => {
+        const form = new FormData();
+        form.append("chat_id", String(chatId));
 
-    await withRetry(
-        () => bot.telegram.sendMediaGroup(chatId, media),
-        CONFIG.uploadRetries,
-        `Photo group starting page ${firstPageNumber}`
-    );
+        const media = processedImages.map((img, index) => {
+            const fieldName = `photo_${index}`;
+            form.append(
+                fieldName,
+                new Blob([img.buffer], { type: "image/jpeg" }),
+                `hitomi_${galleryId}_page_${firstPageNumber + index}.jpg`
+            );
+            return {
+                type: "photo",
+                media: `attach://${fieldName}`
+            };
+        });
+
+        form.append("media", JSON.stringify(media));
+
+        const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMediaGroup`, {
+            method: "POST",
+            body: form,
+            signal: AbortSignal.timeout(120_000)
+        });
+
+        const data = await res.json();
+        if (!res.ok || !data.ok) {
+            const err = new Error(data.description || `HTTP ${res.status}`);
+            err.response = data;
+            throw err;
+        }
+    }, CONFIG.uploadRetries, `Photo group starting page ${firstPageNumber}`);
 }
+
 
 async function updateProgress(chatId, messageId, text) {
     return bot.telegram
